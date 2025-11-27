@@ -20,8 +20,12 @@ class TorchModelWrapper:
         self.base_config = base_config
         self.model_config = model_config
         self.trainer_config = trainer_config
-
+        
         self.model_id = self.base_config.model_id
+        # Sometimes PyTorch may not switch the active device context for all operations
+        # This causes illegal memory access error
+        if self.trainer_config.gpu!=-1:
+            torch.cuda.set_device(self.trainer_config.gpu)
         self.device = set_device(self.trainer_config.gpu)
 
         self.model.to(self.device)
