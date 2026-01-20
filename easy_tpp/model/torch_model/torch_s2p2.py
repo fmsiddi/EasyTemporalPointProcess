@@ -8,7 +8,7 @@ from easy_tpp.model.torch_model.torch_basemodel import TorchBaseModel
 from easy_tpp.ssm.models import LLH, Int_Backward_LLH, Int_Forward_LLH
 
 
-class ComplexEmbedding(nn.Module):
+class ComplexEmbedding(nn.Module): # test comment
     def __init__(self, *args, **kwargs):
         super(ComplexEmbedding, self).__init__()
         self.real_embedding = nn.Embedding(*args, **kwargs)
