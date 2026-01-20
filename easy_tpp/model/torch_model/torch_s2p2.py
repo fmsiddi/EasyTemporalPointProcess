@@ -7,17 +7,20 @@ from easy_tpp.model.torch_model.torch_baselayer import ScaledSoftplus
 from easy_tpp.model.torch_model.torch_basemodel import TorchBaseModel
 from easy_tpp.ssm.models import LLH, Int_Backward_LLH, Int_Forward_LLH
 
-
-class ComplexEmbedding(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(ComplexEmbedding, self).__init__()
-        self.real_embedding = nn.Embedding(*args, **kwargs)
+# when creating any "layer" 
+class ComplexEmbedding(nn.Module): # Embedding layer for complex-valued embeddings (nn.MOdule is the base class for all neural network modules in PyTorch)
+    def __init__(self, *args, **kwargs): # args and kwargs are passed to nn.Embedding
+        super(ComplexEmbedding, self).__init__() # Initialize the parent nn.Module
+            # super(ClassName,self) means Give me the next class in the method resolution order (MRO) after ClassName
+        self.real_embedding = nn.Embedding(*args, **kwargs) 
         self.imag_embedding = nn.Embedding(*args, **kwargs)
+        # ^use pytorch's "Embedding" layer to create a simple lookup table that stores embeddings of a fixed dictionary and size
 
-        self.real_embedding.weight.data *= 1e-3
+        self.real_embedding.weight.data *= 1e-3 # initialize weights to small values
         self.imag_embedding.weight.data *= 1e-3
 
-    def forward(self, x):
+    # Forward pass to get complex embeddings (using pytorch's "complex" tensor class that creates complex tensors: https://docs.pytorch.org/docs/stable/generated/torch.complex.html)
+    def forward(self, x): 
         return torch.complex(
             self.real_embedding(x),
             self.imag_embedding(x),
@@ -26,7 +29,7 @@ class ComplexEmbedding(nn.Module):
 
 class IntensityNet(nn.Module):
     def __init__(self, input_dim, bias, num_event_types):
-        super().__init__()
+        super().__init__() # Initialize the parent nn.Module
         self.intensity_net = nn.Linear(input_dim, num_event_types, bias=bias)
         self.softplus = ScaledSoftplus(num_event_types)
 
