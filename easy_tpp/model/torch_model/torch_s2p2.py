@@ -8,7 +8,8 @@ from easy_tpp.model.torch_model.torch_basemodel import TorchBaseModel
 from easy_tpp.ssm.models import LLH, Int_Backward_LLH, Int_Forward_LLH
 
 # when creating any "layer" 
-class ComplexEmbedding(nn.Module): # Embedding layer for complex-valued embeddings (nn.MOdule is the base class for all neural network modules in PyTorch)
+class ComplexEmbedding(nn.Module): # Embedding layer for complex-valued embeddings for the diagonalized SSM matrices 
+                                   # (nn.Module is the base class for all neural network modules in PyTorch)
     def __init__(self, *args, **kwargs): # args and kwargs are passed to nn.Embedding
         super(ComplexEmbedding, self).__init__() # Initialize the parent nn.Module
             # super(ClassName,self) means Give me the next class in the method resolution order (MRO) after ClassName
@@ -19,7 +20,8 @@ class ComplexEmbedding(nn.Module): # Embedding layer for complex-valued embeddin
         self.real_embedding.weight.data *= 1e-3 # initialize weights to small values
         self.imag_embedding.weight.data *= 1e-3
 
-    # Forward pass to get complex embeddings (using pytorch's "complex" tensor class that creates complex tensors: https://docs.pytorch.org/docs/stable/generated/torch.complex.html)
+    # Forward pass to get complex embeddings (using pytorch's "complex" tensor class that creates complex tensors: 
+    # https://docs.pytorch.org/docs/stable/generated/torch.complex.html)
     def forward(self, x): 
         return torch.complex(
             self.real_embedding(x),
@@ -27,9 +29,12 @@ class ComplexEmbedding(nn.Module): # Embedding layer for complex-valued embeddin
         )
 
 
-class IntensityNet(nn.Module):
+class IntensityNet(nn.Module): # this is the equation found in section 3.4 of the S2P2 paper a little bit below equation (14)
     def __init__(self, input_dim, bias, num_event_types):
         super().__init__() # Initialize the parent nn.Module
+        # nn.Linear is a linear transformation layer: y = xA^T + b
+        # first input is input dimension, second is output dimension, third is whether to include bias term
+        # the "net" stands for "network", even though it's just a single linear layer here
         self.intensity_net = nn.Linear(input_dim, num_event_types, bias=bias)
         self.softplus = ScaledSoftplus(num_event_types)
 
@@ -67,18 +72,48 @@ class S2P2(TorchBaseModel):
             complex_values=model_config.model_specs.get("complex_values", True),
         )
 
+        # the following two variants are separate implemntations of the LLH layer used to compute the non-event integral term (\int\lambda(t) dt)
+        # efficiently and without leakage by changing which direction certain "left-limit/pre-event" quantities are propagated.
+        # S2P2 needs intensities at two kinds of times: event times which must use left-limit information, and sampled times inside intervals
+        # for MC integration which must evolve continuously from known state events.
+        # the forward variant appears to be a rewrite specialized for the MC integral path: start at the right-limit, move forward
+        # by delta_t, decode.
+        # the backward variant is made explicit in S2P2.forward: they layer returns next_layer_left_u_BNH, and then stores left_u_BNm1H
+        # (pre-event residual stream) and uses it directly to compute intensities at event times.
+        # this means the backward variant is designed to produce the pre-event ('left') residual stream u_t_i- directly, instead of
+        # reconstructing left-limit information from right limits after the fact
+        
+        # after looking at easy_tpp.ssm.modles and looking at the LLH, Int_Forward_LLH, and Int_Backward_LLH classes,
+        # the variant variables are triggers for which class to use in the if elif else block below. I will explain more down there
         int_forward_variant = model_config.model_specs.get("int_forward_variant", False)
-        int_backward_variant = model_config.model_specs.get(
-            "int_backward_variant", False
-        )
+        int_backward_variant = model_config.model_specs.get("int_backward_variant", False)
         assert (
             int_forward_variant + int_backward_variant
         ) <= 1  # Only one at most is allowed to be specified
 
+        # for this next part, remember that u is not actually step-wise constant, it is an internal resudal-stream signal computed from
+        # the continuously evolving state x(t) via u(t) = C x(t) + D u_prev + impulse. So u(t) can differ across the interval even if
+        # there are no events. In these LLH layers, even between the events:
+        # x(s) decays continuously from x_t to x_t' according to the matrix exponential of Lambda (SSM dynamics)
+        # y(s) depends on x(s)
+        # u(s) is obtained from y(s) by a nonlinear/residual transformation (in this code, the "depth pass" path)
+        # this is why the code has two different ways to plug u into the \int e^{\Lambda(\cdot)}*B*u(s) ds term:
+            # forward variant uses uses current_right_u_H (the start-of_interval value u(t+))
+            # backward variant uses next_left_u_GH (the end-of-interval value u(t'-))
+        # both are approximations to the integral term, but they differ in which side of the interval they use to hold u constant.
+        
+        # if using forward, then ZOH holds u_t constant [t,t'] forward in time: u(s) = u_t for s in [t,t']
+        # here the Bu term is integrated wrt ds instead of dNt as it is in the base LLH class, 
+        # so the integral term in the x(t) equation becomes (e^{\Lambda(t'-t)}-I) * \Lambda^{-1} * B * u_t
         if int_forward_variant:
             llh_layer = Int_Forward_LLH
+        # if using backward, then ZOH holds u_t'- constant BACKWARDS in time: u(s) = u_t'- for s in [t, t']
         elif int_backward_variant:
             llh_layer = Int_Backward_LLH
+        # in the base LLH implementation, Bu is integrated wrt dNt, so the integral term in the x(t) equation becomes B * u_t * \alpha_t
+        # this means the Bu contribution only occurs at event indices, bundled into the same impulse sequence as the mark impulse.
+        # this is NOT the ZOH discretization of the continuous input. In summary LLH is closer to a pure jump-driven recurrence,
+        # and Int_*_LLH are closer to continuous-time SSMs with ZOH inputs.
         else:
             llh_layer = LLH
 
