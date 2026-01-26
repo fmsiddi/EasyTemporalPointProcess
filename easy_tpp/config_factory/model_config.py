@@ -190,10 +190,12 @@ class BaseConfig(Config):
                           specs=self.specs)
 
 
-class ModelConfig(Config):
+class ModelConfig(Config): # this is container for model hyperparameters mostly read from a YAML file that is passed into all EasyTPP models
     def __init__(self, **kwargs):
         """Initialize the Config class.
         """
+        # the .get method of a dictionary returns the value for the specified key if key is in dictionary.
+        # If not, it returns the default value provided as the second argument.
         self.rnn_type = kwargs.get('rnn_type', 'LSTM')
         self.hidden_size = kwargs.get('hidden_size', 32)
         self.time_emb_size = kwargs.get('time_emb_size', 16)

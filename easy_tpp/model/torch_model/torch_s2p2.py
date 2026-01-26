@@ -89,6 +89,7 @@ class S2P2(TorchBaseModel):
         int_backward_variant = model_config.model_specs.get("int_backward_variant", False)
         assert (
             int_forward_variant + int_backward_variant
+            
         ) <= 1  # Only one at most is allowed to be specified
 
         # for this next part, remember that u is not actually step-wise constant, it is an internal resudal-stream signal computed from
@@ -119,31 +120,79 @@ class S2P2(TorchBaseModel):
 
         self.backward_variant = int_backward_variant
 
+        # this part sets up the layers of the S2P2 model according to the number of layers specified in the model config
         self.layers = nn.ModuleList(
             [
                 llh_layer(**layer_kwargs, is_first_layer=i == 0)
                 for i in range(self.n_layers)
             ]
         )
+        
+        # this initializes the mark impulse \alpha (H \times K) embedding (without E)
+        # each \alpha_k is a real-value vector of dimension H, associated with event type k
+        # it is not yet in state-space dimension P, the LLH later maps it via the matrix E
+        # it should be noted here the event impulse matrix \alpha is globally shared across all layers,
+        # however each layer has its own E^{l} matrix to map \alpha into state-space dimension P
         self.layers_mark_emb = nn.Embedding(
-            self.num_event_types_pad,
+            self.num_event_types_pad, # K
             self.H,
         )  # One embedding to share amongst layers to be used as input into a layer-specific and input-aware impulse
         self.layer_type_emb = None  # Remove old embeddings from EasyTPP
-        self.intensity_net = IntensityNet(
+        self.intensity_net = IntensityNet( # initializing intensity network with linear part and scaled soft-plus.
+                                           # intensity_net.forward() will actually produce the intensity values
             input_dim=self.H,
             bias=self.bias,
             num_event_types=self.num_event_types,
         )
 
     def _get_intensity(
-        self, x_LP: Union[torch.tensor, List[torch.tensor]], right_us_BNH
-    ) -> torch.Tensor:
+        self, x_LP: Union[torch.tensor, List[torch.tensor]], right_us_BNH) -> torch.Tensor:
         """
         Assume time has already been evolved, take a vertical stack of hidden states and produce intensity.
+        
+        the Union here is just a type hint from python's typing module, 
+        saying the input x_LP can be either a torch tensor or a list of torch tensors
+        output is a an intensity "tensor" of type torch.tensor
+        
+        The only inputs needed to compute intensity is the list of latent states x for each layer (x_LP),
+        and the list of right-limit residual streams for each layer (right_us_BNH).
+        From these, we can reconstruct the left-limit residual stream at the final layer (left_u_H),
+        which is then decoded to intensity via the intensity network.
+        
+        The following suffix components encode tensor dimensions:
+        B: batch dimension
+        N: event index (sequence length)
+        G: grid/MC sample index
+        L: layer index
+        P: state dimension
+        H: residual/hidden stream dimension
+        
+        Pluralization matters:
+        u = one depth signal
+        us = a list (or stack) of depth signals across layers
+        
+        Examples:
+        left_u_H = u_t-^(l) for current layer l (it shows up in a loop thru layers below) at time t- of dimension H (no time or layer axis)
+        right_us_BNH = [u_t+^(1), u_t+^(2),..., u_t+^(L)] list of right-limit u's (tensors) at time t+ for all layers, each of shape (B,N,H)
+            to be clear, right_us_BNH[i] = u_t+^(i+1) of shape (B,N,H). the "us" implies a list over layers
+        x_LP is either:
+            list of tensors [x^(1), x^(2), ..., x^(L)] each of shape P -- list over layers
+            -OR-
+            a single tensor with layer axis [L, P]
+        u_GH = 
+        
+        Recall the formula for the intensity vector is ScaledSoftplus(W * u_t-^(L+1) + b)
+        u_t-^(L+1) is determined by non-linear recursive stacking of all previous layers. For example, the final recursion is:
+        u_t-^(L+1) = LayerNorm^(l)(\sigma(y_t^(l)) + u_t^(l))
+        of course, y_t^(l) = C^(l) * x_t^(l) + D^(l) * u_t^(l), and you can recursively unpack this all the way down to the first layer
+        this is why in this _get_intensity function, the layer.depth_pass() method is called that is a "depth-only" pass that 
+        reconstructs u_t-^(L+1) without evolving x(t) forward in time again. Hence the "Assume time has already evolved" comment above.
+        
+        TODO: the layer.depth_pass() method is annotated in ssms.models.LLH class.
         """
         left_u_H = None
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(self.layers): # iterating through each layer, starting with initial latent state x_LP,
+                                                # to get final left_u_H at the last layer, which is required to compute intensity
             if isinstance(
                 x_LP, list
             ):  # Sometimes it is convenient to pass as a list over the layers rather than a single tensor
@@ -160,6 +209,24 @@ class S2P2(TorchBaseModel):
         return self.intensity_net(left_u_H)  # self.ScaledSoftplus(self.linear(left_u_H))
 
     def _evolve_and_get_intensity_at_sampled_dts(self, x_LP, dt_G, right_us_H):
+        """
+        Whereas _get_intensity assumes time has already evolved and returns a single intensity at left limit of some time
+        (typically an event time, since those are the only times we have left-limit states for),
+        this function allows for the computation of the integral \int_{t_i}^{t_i+1} \lambda(s) ds by evolving the latent state
+        x(t) from the right-limit at t_i+ to sampled times inside the interval [t_i, t_i+1), and then decoding
+        the intensity at those sampled times. _get_intensity assumes you have all the latent states at the end of the time period,
+        whereas this function is for when you only have an initial latent state at the start of the time period and need to evolve forward.
+        
+        This function is necessary for computing the "non-event" integral term in the log-likelihood (via Monte Carlo integration)
+        
+        It should be noted here that x_LP are the latent states at some starting time (in practice, the right-limit at event time t_i+),
+        whereas in _get_intensity, x_LP are the latent states at some ending time (in practice, the left-limit at event time t_i+1-).
+        
+        dt_G is a tensor of sampled time offsets \delta_t ("grid points" G) within each interval
+        right_us_H is the list of right-limit residual streams at the starting time (t_i+) for each layer
+        
+        TODO: layer.get_left_limit() is annotated in ssms.models.LLH class.
+        """
         left_u_GH = None
         for i, layer in enumerate(self.layers):
             x_GP = layer.get_left_limit(
@@ -175,57 +242,83 @@ class S2P2(TorchBaseModel):
             ) 
         return self.intensity_net(left_u_GH)  # self.ScaledSoftplus(self.linear(left_u_GH))
 
-    def forward(
+    def forward( # the "Optional" type hint Optional[torch.Tensor] means the argument can be either a torch.Tensor or None 
         self, batch, initial_state_BLP: Optional[torch.Tensor] = None, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Batch operations of self._forward
+        Batch operations of self._forward, meaning it processes many sequences in parallel in one call rather than one sequence at at time
+        
+        The "batching" refers to how when training, we will be maximizing the log-likelihood across many sequences in parallel,
+        \sum_{b=1}^{B} log p({(t_i, m_i)}_{i=1}^{N_b} | \Theta)
+        So the "batch size" is just the number of sequences specified in the model config that will be used in this implementation.
+        single sequence: tensors shaped like [N, ...]
+        batch of sequences: tensors shaped like [B, N, ...]
+        
+        t_BN: event times for batch (B sequences, each of length N (the number of events))
+        dt_BN: inter-event times for batch
+        marks_BN: event types for batch
+        batch_non_pad_mask: mask for non-padding events in batch (1 if real event, 0 if padding)
+        _ : placeholder for any additional batch elements not used here
         """
         t_BN, dt_BN, marks_BN, batch_non_pad_mask, _ = batch
 
-        right_xs_BNP = []  # including both t_0 and t_N
-        left_xs_BNm1P = []
-        right_us_BNH = [
-            None
-        ]  # Start with None as this is the 'input' to the first layer
-        left_u_BNH, right_u_BNH = None, None
-        alpha_BNP = self.layers_mark_emb(marks_BN)
+        right_xs_BNP = []  # list over layers: each is [B,N,P], including both t_0 and t_N
+        left_xs_BNm1P = [] # list over layers: each is [B,N-1,P] (non-backward variant)
+        right_us_BNH = [None]  # list over layers+1: per layer right u, element 0 is None as this is the 'input' to the first layer
+        left_u_BNH, right_u_BNH = None, None # current layer's input as layer depth is traversed, initialized to None for first layer
+        alpha_BNP = self.layers_mark_emb(marks_BN) # this is the mark impulse embedding \alpha_k_i for each event in the batch
+                                                   # name says BNP but \alpha is actually BNH, 
+                                                   # maybe they are referring to after projection by E?
 
         for l_i, layer in enumerate(self.layers):
-            # for each event, compute the fixed impulse via alpha_m for event i of type m
+            # for each event, compute the fixed impulse via alpha_m for event i of type m (i in N, m in K)
             init_state = (
                 initial_state_BLP[:, l_i] if initial_state_BLP is not None else None
             )
 
-            # Returns right limit of xs and us for [t0, t1, ..., tN]
-            # "layer" returns the right limit of xs at current layer, and us for the next layer (as transformations of ys)
-            # x_BNP: at time [t_0, t_1, ..., t_{N-1}, t_N]
-            # next_left_u_BNH: at time [t_0, t_1, ..., t_{N-1}, t_N] -- only available for backward variant
-            # next_right_u_BNH: at time [t_0, t_1, ..., t_{N-1}, t_N] -- always returned but only used for RT
+            """
+            Returns right limit of xs and us for [t0, t1, ..., tN] by doing forward pass through the current layer in the loop
+            "layer" returns the right limit of xs at current layer, and us for the next layer (as transformations of ys)
+            x_BNP: at time [t_0, t_1, ..., t_{N-1}, t_N]
+            next_left_u_BNH: at time [t_0, t_1, ..., t_{N-1}, t_N] -- only available for backward variant
+            next_right_u_BNH: at time [t_0, t_1, ..., t_{N-1}, t_N] -- always returned but only used for RT
+            """
             x_BNP, next_layer_left_u_BNH, next_layer_right_u_BNH = layer.forward(
                 left_u_BNH, right_u_BNH, alpha_BNP, dt_BN, init_state
             )
+            
             assert next_layer_right_u_BNH is not None
-
             right_xs_BNP.append(x_BNP)
+            
+            """
+            if NOT backward variant, compute left-limit x(t_i-) from right-limit x(t_{i-1}+)
+            here we are creating a list of left-limit xs at each event time except the first (t_1-, t_2-, ..., t_N-) using
+            the .get_left_limit() method of the layer, which evolves the right-limit state at t_{i-1}+ forward by dt_i 
+            to get left-limit state at t_i-. 
+            TODO: the annotated notes for this method are in ssms.models.LLH class.
+            this method takes 4 elements as input:
+                right_limit_P: the last timestep of x_BNP across all batches and states,
+                dt_G: dt_BN[..., 1:].unsqueeze(-1),
+                    dt_BN[..., 1:] has shape [B,N-1], and unsqueeze(-1) makes it [B,N-1,1] to add a trailing dimension for broadcasting
+                    this is needed because in get_left_limit, dt_G is expected to have shape [B,N-1,G], where G is the number of grid points
+                    (here G=1)
+                current_right_u_H: th.Tensor,
+                next_left_u_GH: th.Tensor,
+            note the "..." operator means "slice (:) all preceding dimensions
+            """
             if next_layer_left_u_BNH is None:  # NOT backward variant
                 left_xs_BNm1P.append(
                     layer.get_left_limit(  # current and next at event level
                         x_BNP[..., :-1, :],  # at time [t_0, t_1, ..., t_{N-1}]
-                        dt_BN[..., 1:].unsqueeze(
-                            -1
-                        ),  # with dts [t1-t0, t2-t1, ..., t_N-t_{N-1}]
-                        current_right_u_H=right_u_BNH
-                        if right_u_BNH is None
-                        else right_u_BNH[
-                            ..., :-1, :
-                        ],  # at time [t_0, t_1, ..., t_{N-1}]
-                        next_left_u_GH=left_u_BNH
-                        if left_u_BNH is None
-                        else left_u_BNH[..., 1:, :].unsqueeze(
-                            -2
-                        ),  # at time [t_1, t_2 ..., t_N]
-                    ).squeeze(-2)
+                        dt_BN[..., 1:].unsqueeze(-1),  # with dts [t1-t0, t2-t1, ..., t_N-t_{N-1}]
+                                                       # recall "unsqueeze" turns an n-d tensor into an n+1-d tensor by adding
+                                                       # a dimension of size 1 at the specified index (-1 means at the end here)
+                        current_right_u_H = right_u_BNH if right_u_BNH is None
+                                                        else right_u_BNH[..., :-1, :],  # at time [t_0, t_1, ..., t_{N-1}]
+                        next_left_u_GH = left_u_BNH if left_u_BNH is None
+                                                    else left_u_BNH[..., 1:, :].unsqueeze(-2),  # at time [t_1, t_2 ..., t_N]
+                    ).squeeze(-2) # get it back to shape [B,N-1,P] by removing the singleton dimension added in get_left_limit
+                    
                 )
             right_us_BNH.append(next_layer_right_u_BNH)
 
