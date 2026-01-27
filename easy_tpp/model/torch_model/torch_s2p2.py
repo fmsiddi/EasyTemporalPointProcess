@@ -345,9 +345,14 @@ class S2P2(TorchBaseModel):
     def loglike_loss(self, batch, **kwargs):
         """
         this method computes the conditional log-likelihood loss for a batch of sequences. This is expressed in the paper as:
-        log p({(t_i, k_i)}_{i=1}^{N} | \Theta) = \sum_{i=1}^{N} log \lambda_{k_i}(t_i-) - \int_{0}^{T} \lambda(t) dt
+        log p({(t_i, k_i)}_{i=1}^{N} | \Theta) = \sum_{i=1}^{N} log(\lambda_{k_i}(t_i-)) - \sum_{i=1}^{N} \int_{0}^{T} \lambda_k_i(t) dt
         where the first term is the log-intensity at event times (from the left limit),
         and the second term is the integral of the intensity over the observation window (computed via Monte Carlo integration).
+        
+        This method is a sort of "orchestration" for the log likelihood specific to S2P2, which takes into account right/left limits,
+        whereas torch_basemodel.compute_loglikelihood is a more general MATHEMATICAL method that just computes the log-likelihood.
+        loglike_loss does the S2P2 forward pass, computes intensities at event times and sampled times, and the passes these agruments
+        into torch_basemodel.compute_loglikelihood to get the actual log-likelihood values for the S2P2 model.
 
         hidden states at the left and right limits around event time; note for the shift by 1 in indices:
         consider a sequence [t0, t1, ..., tN]
@@ -357,9 +362,7 @@ class S2P2(TorchBaseModel):
         right_x: x0, x1, x2, ... <-> x_{t_0+}, x_{t_1+}, ..., x_{t_N+} for all layers
         right_u: u0, u1, u2, ... <-> u_{t_0+}, u_{t_1+}, ..., u_{t_N+} for all layers
         """
-        forward_results = self.forward(
-            batch
-        )  # N minus 1 comparing with sequence lengths
+        forward_results = self.forward(batch)  # N minus 1 comparing with sequence lengths
         right_xs_BNLP, right_us_BNH = (
             forward_results["right_xs_BNLP"],
             forward_results["right_us_BNH"],
@@ -397,6 +400,7 @@ class S2P2(TorchBaseModel):
             right_us_BNm1H,
         )
 
+        # TODO: add code annotations for the more general torch_basemodel.compute_loglikelihood
         event_ll, non_event_ll, num_events = self.compute_loglikelihood(
                 lambda_at_event=intensity_B_Nm1_M,
                 lambdas_loss_samples=intensity_dts_B_Nm1_G_M,
@@ -414,6 +418,10 @@ class S2P2(TorchBaseModel):
         self, event_times_BN, inter_event_times_BN, marks_BN, sample_dtimes, **kwargs
     ):
         """Compute the intensity at sampled times, not only event times.  *from the left limit*
+        
+        This method is a public-ish method used for prediction/simulation taht is passed into the thinning-based sampler:
+        EventSampler.draw_next_time_one_step(). It's a higher-level wrapper whose job is essentially:
+        "given the observed history (times & marks) and some propsed sample offsets, return intensities at those sample offsets"
 
         Args:
             time_seq (tensor): [batch_size, seq_len], times seqs.
