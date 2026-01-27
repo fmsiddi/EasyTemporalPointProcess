@@ -343,14 +343,20 @@ class S2P2(TorchBaseModel):
         return ret_val
 
     def loglike_loss(self, batch, **kwargs):
-        # hidden states at the left and right limits around event time; note for the shift by 1 in indices:
-        # consider a sequence [t0, t1, ..., tN]
-        # Produces the following:
-        # left_x: x0, x1, x2, ... <-> x_{t_1-}, x_{t_2-}, x_{t_3-}, ..., x_{t_N-} (note the shift in indices) for all layers
-        #    OR ==>               <-> u_{t_1-}, u_{t_2-}, u_{t_3-}, ..., u_{t_N-} for last layer
-        #
-        # right_x: x0, x1, x2, ... <-> x_{t_0+}, x_{t_1+}, ..., x_{t_N+} for all layers
-        # right_u: u0, u1, u2, ... <-> u_{t_0+}, u_{t_1+}, ..., u_{t_N+} for all layers
+        """
+        this method computes the conditional log-likelihood loss for a batch of sequences. This is expressed in the paper as:
+        log p({(t_i, k_i)}_{i=1}^{N} | \Theta) = \sum_{i=1}^{N} log \lambda_{k_i}(t_i-) - \int_{0}^{T} \lambda(t) dt
+        where the first term is the log-intensity at event times (from the left limit),
+        and the second term is the integral of the intensity over the observation window (computed via Monte Carlo integration).
+
+        hidden states at the left and right limits around event time; note for the shift by 1 in indices:
+        consider a sequence [t0, t1, ..., tN]
+        Produces the following:
+        left_x: x0, x1, x2, ... <-> x_{t_1-}, x_{t_2-}, x_{t_3-}, ..., x_{t_N-} (note the shift in indices) for all layers
+           OR ==>               <-> u_{t_1-}, u_{t_2-}, u_{t_3-}, ..., u_{t_N-} for last layer
+        right_x: x0, x1, x2, ... <-> x_{t_0+}, x_{t_1+}, ..., x_{t_N+} for all layers
+        right_u: u0, u1, u2, ... <-> u_{t_0+}, u_{t_1+}, ..., u_{t_N+} for all layers
+        """
         forward_results = self.forward(
             batch
         )  # N minus 1 comparing with sequence lengths
