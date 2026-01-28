@@ -14,7 +14,7 @@ def make_HiPPO(P):
     Returns:
         P x P HiPPO LegS matrix
     """
-    M = np.sqrt(1 + 2 * np.arange(P))
+    M = np.sqrt(1 + 2 * np.arange(P)) # M[i] = sqrt(1 + 2i)
     A = M[:, np.newaxis] * M[np.newaxis, :]
     A = np.tril(A) - np.diag(np.arange(P))
     return -A
@@ -57,7 +57,7 @@ def make_DPLR_HiPPO(P):
     """
     A, R1, B = make_NPLR_HiPPO(P)
 
-    S = A + R1[:, np.newaxis] * R1[np.newaxis, :]
+    S = A + R1[:, np.newaxis] * R1[np.newaxis, :] # S = A + R1 R1^T
 
     S_diag = np.diagonal(S)
     Lambda_real = np.mean(S_diag) * np.ones_like(S_diag)

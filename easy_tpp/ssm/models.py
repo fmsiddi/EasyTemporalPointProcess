@@ -4,7 +4,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .initializers import (
+from .initializers import ( # TODO: see ssm.initializers.py
     make_DPLR_HiPPO,  # , lecun_normal_ #  init_VinvB, init_log_steps,
 )
 
@@ -36,14 +36,6 @@ class LLH(nn.Module):
         relative_time: bool = False,
         complex_values: bool = True,
     ):
-        """
-
-        :param P:
-        :param H:
-        :param dt_init_min:
-        :param dt_init_max:
-        :param act_func:
-        """
 
         super(LLH, self).__init__()
 
