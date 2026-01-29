@@ -4,7 +4,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .initializers import ( # TODO: see ssm.initializers.py
+from .initializers import (
     make_DPLR_HiPPO,  # , lecun_normal_ #  init_VinvB, init_log_steps,
 )
 
