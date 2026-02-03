@@ -47,10 +47,66 @@ class LLH(nn.Module):
         self.dropout_rate = dropout_rate
         self.complex_values = complex_values
 
+        
         # select the activation function.
-        if act_func == "gelu":
+
+        # each layer's output can be viewed as y^(l) := LLH^(l)(u^(l), \mathcal{H})
+        # where LLH is the forward pass of the LLH layer, and \mathcal{H} is the history (time deltas, marks, etc).
+
+        # this output is then:
+        # 1) fed into a non-linear activation function (chosen from below)
+        # 2) added to the initial input of the layer
+        # 3) (normalized if post_norm=True) before being passed into the next layer as input u^(l+1)
+
+        # all-in-all: u^(l+1) = LayerNorm( \sigma(y^(l)) + u^(l) )
+
+        # the if block below defines \sigma, the activation function.
+
+        # It should be noted that this activation just deals with activations between SSM layers. There is a final
+        # activation at the end of the entire network (after all LLH layers) that is separate from this for
+        # converting u_{t-}^(L+1) into an intensity \lambda_t, namely:
+        # \lambda_t = ScaledSoftplus(Linear(u_{t-}^(L+1)))
+
+        # furthermore, the placement of nn.Dropout (masking of random units in the computation graph for the 
+        # purposes of regularization) will be explained in the comments for each activation.
+        if act_func == "gelu": # GELU(x) := x * Phi(x) where Phi is the CDF of the standard normal distribution
+                               # it is a smooth approximation to ReLU that suggests a more probabilistic
+                               # view of a neuron's output. This is the activation used in the S2P2  and 
+                               # Neural hawkes papers, so it will be the primary activation function to use.
+                               # if Dropout layer is D(), then D(GELU(x)) is what's going on here.
+                               # it is "regularizing the features produced by the nonlinearity"
+                               # GELU(D(x)) on the otherhand would randomly remove features of the input before
+                               # activation, which is not what we want.
             self.act_func = nn.Sequential(nn.GELU(), nn.Dropout(p=self.dropout_rate))
-        elif act_func == "full_glu":
+        
+        # from: "Language Modeling with Gated Convolutional Networks" (Dauphin et al., 2017):
+        # 
+        # "gating" mechanisms control the path through which information flows and is used in recurrent nn's.
+        # examples like "input gates" and "forget gates" in LSTMs allow for information to flow unimpeded
+        # through potentially many timesteps. without these gates, information could easily vanish or explode
+        # through the transofmrations of each timestep.
+
+        # convolutional networks typically did not use gating mechanism until Oord et al., 2016 introduced
+        # an LSTM-style mechanism of tanh(X*W+b) \otimes sigmoid(X*V+c)
+        # GLU is a simplifcation (removal of the tanh) of this for non-deterministic gates that reduce the 
+        # vanishing gradient problem by coupling linear units to the gates. this retains the non-linear 
+        # capabilities of the layer while allowing the gradient to propagate through the linear unit 
+        # without scaling. read more here: 
+        # https://medium.com/deeplearningmadeeasy/glu-gated-linear-unit-21e71cd52081
+        # that blog post will particularly explain why the input dimension is doubled in GLU
+        # (faster implementation)
+
+        # pytorch's nn.GLU is effectively nn.Linear(X) * nn.Linear(X).sigmoid()
+        # or: GLU(a,b) = a \circdot \sigmoid(b) where [a,b] = Linear(X)
+
+        # the reason this activation is included is because it is used in the S4 paper.
+
+        # we have full_GLU(x) = D(GLU(D(W*x + b))) where D is Dropout, W,b are weights and biases of nn.Linear
+        # the first dropout applied to the linear output is to regularize the two branches of what will be 
+        # entered as input in the GLU operation. the second dropout is to regularize the output features of the 
+        # GLU operation itself.
+
+        elif act_func == "full_glu": # GLU: Gated Linear Unit
             self.act_func = nn.Sequential(
                 nn.Linear(self.H, 2 * self.H),
                 nn.Dropout(p=self.dropout_rate),
@@ -58,6 +114,11 @@ class LLH(nn.Module):
                 nn.Dropout(p=self.dropout_rate),
             )
 
+        # in the S5 paper, to take advantage of the fact that the S5 SSM outputs have already been mixed
+        # throughout the MIMO SSM, they use a "weighted sigmoid gated unit" (a GLU activation without an
+        # additional linear transform bfore the sigmoid): GELU(y) \circdot sigmoid(W * GELU(y))
+        # read "Weighted sigmoid gate unit for an activation function of deep neural network" (Tanaka, 2020)
+        # for further details.
         elif (
             act_func == "half_glu"
         ):  # ref: https://github.com/lindermanlab/S5/blob/main/s5/layers.py#L76
