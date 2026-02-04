@@ -30,7 +30,8 @@ class LLH(nn.Module):
         act_func: str = "gelu",  # F.gelu,
         for_loop: bool = False,
         pre_norm: bool = True,
-        post_norm: bool = False,
+        post_norm: bool = False, # confusing why this is defaulted to False, seeing as
+                                 # in the paper they always do post-norm
         simple_mark: bool = True,
         is_first_layer: bool = False,
         relative_time: bool = False,
@@ -138,9 +139,28 @@ class LLH(nn.Module):
         # Assume we always use conjugate symmetry.
         self.conj_sym = True
 
-        # Allow a learnable initial state.
-        # Needs to be =/= 0 since we take the log to compute
-        if self.complex_values:
+        # Allow a learnable initial state initial_state_P (\tilde{x}_0 = V^{-1}x_0).
+        # Needs to be =/= 0 since we take the log during parallel scan.
+        # it should be noted here that initial_state_P is NOT the same as x_0.
+        # x_0 is meant to stay real-valued, however after diagonalization of A,
+        # we have \tilde{x}_0 = V^{-1} x_0 which is generally complex-valued.
+        # this allows for state/output evolution within the eigenbasis of A.
+        # this is why it looks like the state is being allowed to be complex-valued
+        # even though the S2P2 paper states that x_t should be real-valued.
+        # it's because this variable below is actually \tilde{x}_0, not x_0.
+
+        # here is also where we see we may even restrict the diagonalization of A to be
+        # real-valued only, by setting complex_values=False.
+        # although this reduces the representational capacity of the SSM layer (i.e. removes
+        # the ability to have oscillatory eigenmodes), it may be beneficial in the sense that
+        # it forces the model to learn real-valued dynamics which may be more stable and 
+        # easier to train. especially since in the parallel scan part, we will have to take
+        # the log and exp of these states, which may be numerically unstable for complex values.
+
+        # note the imaginary = oscillatory and real = exponential decay comes from the fact
+        # that \Lambda_p = -e^{\theta_p} + i\omega_p, which implies:
+        # e^{\Lambda_p*\delta t} = e^{-e^{\theta_p}*\delta t} * (cos(\omega_p*\delta t) + i sin(\omega_p*\delta t))
+        if self.complex_values: # allows for more expressive dynamics at computational cost
             self.initial_state_P = nn.Parameter(
                 th.complex(
                     th.randn(
@@ -161,13 +181,42 @@ class LLH(nn.Module):
                 requires_grad=True,
             )
 
-        self.norm = nn.LayerNorm(self.H)
-        self.for_loop = for_loop
-        self.pre_norm = pre_norm
-        self.post_norm = post_norm
+        # remember we discussed earlier that u^(l+1) = LayerNorm( \sigma(y^(l)) + u^(l) )
+        # the activation function selection block prior to this comment defines \sigma
+        # this line below defines the LayerNorm part.
 
-        self.is_first_layer = is_first_layer
-        self.relative_time = relative_time
+        # here we instantiate a LayerNorm module in the shape of the output dimension H.
+        # pytorch's LayerNorm implements the operation as described in the paper "Layer
+        # Normalization" (Ba et al., 2016):
+        # y = (gamma * (x - mu) / sqrt(var + epsilon)) + beta
+        # where gamma and beta are learnable affine transform parameters, each of shape H.
+        # there is a keyword argument elementwise_affine (default=True) that controls whether
+        # these parameters are learnable or not, which clearly they are here.
+
+        # as you've seen in this code in several places, you want to instantiate pytorch modules
+        # and assign them to variable names that act as layers from then on out.
+        # these variables will carry the learnable parameters forward throughout the code.
+        # we will see later we will pass inputs through this LayerNorm module by calling
+        # self.norm(input_tensor) where input_tensor has shape (..., H)
+        self.norm = nn.LayerNorm(self.H)
+        self.for_loop = for_loop # boolean (default: False) to choose between for-loop or 
+                                 # parallel scan implementation of the SSM state evolution
+
+        # implementation toggles for WHERE LayerNorm is applied (it should be one or the other!)
+        self.pre_norm = pre_norm # boolean (default: True) to apply LayerNorm before SSM layer
+        self.post_norm = post_norm # boolean (default: False) to apply LayerNorm after SSM layer
+
+        self.is_first_layer = is_first_layer # boolean (default: False) to indicate if this 
+                                             # is the first LLH layer
+
+        # this corresponds to the specific extension in the paper: 
+        # input-dependent rescaling of \Lambda
+        # They introduce a variant where, at event time t_i, the diagonal dynamics are 
+        # rescaled by a learned function of the current layer signal u_t_i:
+        # \Lambda_i := diag(softplus(W * u_t_i + b)) * \Lambda
+        # this is exactly "relative"time/"input-conditioned forgetting rate"
+
+        self.relative_time = relative_time # boolean (default: False)
 
         self._init_ssm_params()
 
