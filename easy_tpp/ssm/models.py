@@ -137,6 +137,15 @@ class LLH(nn.Module):
             )
 
         # Assume we always use conjugate symmetry.
+        # why? because it's the standard way to keep a diagonalized complex SSM equivalent
+        # to a real-valued SSM WHILE ONLY USING HALF THE SPECTRUM
+        # if x is real, then x = v + \bar{v} = 2*Re(v) where v is complex
+        # this allows us to store only half the eigenvalues/eigenvectors.
+
+        # the reason we'd even make this adjustable and not baked into the code is possibly
+        # that someone may want to experiment with a fully complex-valued SSM,
+        # or to check if the only storing the half-spectrum isn't introducing 
+        # errors (debugging/ablation)?
         self.conj_sym = True
 
         # Allow a learnable initial state initial_state_P (\tilde{x}_0 = V^{-1}x_0).
