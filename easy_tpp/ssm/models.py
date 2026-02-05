@@ -52,7 +52,7 @@ class LLH(nn.Module):
         # select the activation function.
 
         # each layer's output can be viewed as y^(l) := LLH^(l)(u^(l), \mathcal{H})
-        # where LLH is the forward pass of the LLH layer, and \mathcal{H} is the history (time deltas, marks, etc).
+        # where LLH is the forward pass of the LLH layer, and \mathcal{H} is the history
 
         # this output is then:
         # 1) fed into a non-linear activation function (chosen from below)
@@ -63,9 +63,9 @@ class LLH(nn.Module):
 
         # the if block below defines \sigma, the activation function.
 
-        # It should be noted that this activation just deals with activations between SSM layers. There is a final
-        # activation at the end of the entire network (after all LLH layers) that is separate from this for
-        # converting u_{t-}^(L+1) into an intensity \lambda_t, namely:
+        # It should be noted that this activation just deals with activations between SSM layers. 
+        # There is a final activation at the end of the entire network (after all LLH layers) 
+        # that is separate from this for converting u_{t-}^(L+1) into an intensity \lambda_t, namely:
         # \lambda_t = ScaledSoftplus(Linear(u_{t-}^(L+1)))
 
         # furthermore, the placement of nn.Dropout (masking of random units in the computation graph for the 
@@ -168,7 +168,8 @@ class LLH(nn.Module):
 
         # note the imaginary = oscillatory and real = exponential decay comes from the fact
         # that \Lambda_p = -e^{\theta_p} + i\omega_p, which implies:
-        # e^{\Lambda_p*\delta t} = e^{-e^{\theta_p}*\delta t} * (cos(\omega_p*\delta t) + i sin(\omega_p*\delta t))
+        # e^{\Lambda_p*\delta t} = e^{-e^{\theta_p}*\delta t} * (cos(\omega_p*\delta t) 
+        #                           + i * sin(\omega_p*\delta t))
         if self.complex_values: # allows for more expressive dynamics at computational cost
             self.initial_state_P = nn.Parameter(
                 th.complex(
@@ -312,8 +313,8 @@ class LLH(nn.Module):
                     nn.init.xavier_normal_(self.delta_net.weight)
                     # xavier normal initialization randomly initializes the weights according to a 
                     # normal distribution N(0, std^2) where std = sqrt(2 / (in_features + out_features))
-                    # this type of initialization was invented in order to keep the variance of the activations
-                    # the same across layers, preventing vanishing/exploding gradients.
+                    # this type of initialization was invented in order to keep the variance of the 
+                    # activations the same across layers, preventing vanishing/exploding gradients.
                 )
                 bias = th.ones(
                     self.P,
@@ -340,6 +341,12 @@ class LLH(nn.Module):
                 th.zeros(size=(self.P,)), requires_grad=False
             )
 
+    # In Python, an attribute is a general term for any piece of data or method associated with an object, 
+    # accessed using dot notation (e.g., object.attribute). A property is a special type of attribute that 
+    # uses methods (getter, setter, deleter) to control access and modification, without changing how it is 
+    # accessed syntactically. 
+    # this property is established below so we can recover the \Lambda matrix of the model at any point via
+    # LLH.Lambda_P
     @property
     def Lambda_P(self):
         if self.complex_values:
