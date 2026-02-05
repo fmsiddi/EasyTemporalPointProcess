@@ -229,12 +229,22 @@ class LLH(nn.Module):
 
         self._init_ssm_params()
 
+        # from what i can tell, simple_mark doesn't appear to be used anywhere in the codebase.
+        # i believe this part can be safely ignored.
         self.simple_mark = simple_mark
         if not simple_mark:
             self.mark_a_net = nn.Linear(self.H, self.P, bias=True)
             self.mark_u_net = nn.Linear(
                 self.H, self.P, bias=False
             )  # Only need one bias
+            # quick note on the the syntax below:
+            # "why tensor.weight.data = something intead of tensor.weight = something?"
+            # this is because tensor.weight is a nn.Parameter object, which is a wrapper around a tensor
+            # that tells pytorch to track gradients for it. if we were to do tensor.weight = something,
+            # we would be replacing the nn.Parameter object with a new tensor, which would not be tracked
+            # by pytorch for gradients. by doing tensor.weight.data = something, we are modifying
+            # the underlying tensor data of the nn.Parameter object, which is still tracked by pytorch.
+            # this is a common pattern in pytorch for initializing weights of layers.
             self.mark_a_net.weight.data = th.complex(
                 nn.init.xavier_normal_(self.mark_a_net.weight.data) * 1e-3,
                 nn.init.xavier_normal_(self.mark_a_net.weight.data) * 1e-3,
@@ -250,7 +260,7 @@ class LLH(nn.Module):
             if not self.complex_values:
                 self.mark_a_net.weight.data = self.mark_a_net.weight.data.real
                 self.mark_a_net.bias.data = self.mark_a_net.bias.data.real
-                self.mark_u_net.weight.data = self.self.mark_u_net.weight.data.real
+                self.mark_u_net.weight.data = self.mark_u_net.weight.data.real
 
     def _init_ssm_params(self):
         self._init_A()
@@ -263,32 +273,69 @@ class LLH(nn.Module):
             self._init_D()
         self._init_E()
 
+    # make_DPLR_HiPPO only produces the continuous-time diagonalization \Lambda and eigenvectors V.
+    # -A = V\Lambda V^H
+    # this method below sets up the time-step/time-rescaling mechanism we will need to discretize \Lambda
+    # we will need to eventually compute exp(\Lambda * \delta t)
     def _init_A(self):
         # Define the initial diagonal HiPPO matrix.
         # Te throw the HiPPO B away.
         Lambda_P, _, _, V_PP, _ = make_DPLR_HiPPO(self.P)
+        
+        # by calling nn.Parameter on these tensors, we are telling pytorch to track gradients on them.
+        # furthermore, we need to keep in mind that we will eventually be exponentiating \Lambda * \delta t,
+        # so there is a risk of numerical instability if the real parts of \Lambda are not negative.
+        # therefore, we seek to keep the rel part of the eigenvalues (Re(\lambda)) negative in order to maintain 
+        # stability. however, since the parameters are learned via gradient descent, we can't just tell the 
+        # optimizer "hey stay negative". so instead, we represent Re(\lambda) as -exp(theta) where theta is 
+        # real-valued. so the ACTUAL parameter is theta = log(-Re(\lambda)). So \theta can be drawn in any 
+        # direction by gradient descent, but the final transformation will ensure the resulting real part of
+        # the eigenvalue is negative.
         self.Lambda_P_log_neg_real = th.nn.Parameter((-Lambda_P.real).log())
         self.Lambda_P_imag = th.nn.Parameter(Lambda_P.imag)
 
         # Store these for use later.
+        # makes the eigenvector matrix a property of the class (layer._V_PP)
         self._V_PP = V_PP
         self._Vc_PP = V_PP.conj().T
 
         # We also initialize the step size.
+        # relative_time has to do with whether we want to rescale \Lambda at each event time
+        # based on the current input u_t_i. this is the "input-dependent dynamics" section of the paper.
+        # \Lambda_i = diag(softplus(W * u_t_i + b)) * \Lambda
         if self.relative_time:
-            self.delta_net = nn.Linear(
+            self.delta_net = nn.Linear( # delta_net is the W * u_t_i + b part above
                 self.H, self.P, bias=True
             )  # nn.Parameter(init_log_steps(self.P, self.dt_init_min, self.dt_init_max))
-            with th.no_grad():
+            with th.no_grad(): # no_grad() because we don't want to track gradients for the initialization
                 self.delta_net.weight.copy_(
                     nn.init.xavier_normal_(self.delta_net.weight)
+                    # xavier normal initialization randomly initializes the weights according to a 
+                    # normal distribution N(0, std^2) where std = sqrt(2 / (in_features + out_features))
+                    # this type of initialization was invented in order to keep the variance of the activations
+                    # the same across layers, preventing vanishing/exploding gradients.
                 )
                 bias = th.ones(
                     self.P,
                 )
-                bias += th.log(-th.expm1(-bias))
-                self.delta_net.bias.copy_(bias)
+                # note that softplus(x) = log(1 + exp(x)), so below what is happening is
+                # remember we are multiplying the diagonal of the result of the softplus by \Lambda
+                # so at initialization we want the softplus's output to be close to 1, so \Lambda_i
+                # is close to \Lambda.
+                # now, we already have that the input u at initialization is 0, so the W*u term in the
+                # softplus will be 0. so we are left with initializing the bias such that softplus(bias) = 1
+                # this is done algebraically by first, algebra:
+                # softplus(bias) = log(1 + exp(bias)) = 1 --> bias = log(exp(1) - 1) = log(expm1(1))
+                # however, the bias vector needs to be initialized with a dimension of P, so they initialize
+                # it as a P-dimensional tensor of ones, then add log(-expm1(-1)) to each element,
+                # which results in the log(exp(1) - 1) we initially wanted.
+                # furthermore, x + log(1-e^-x) is more numerically stable for small values of x than log(exp(x)-1)
+                # this is actually why expm1(x) even exists as a function
+                bias += th.log(-th.expm1(-bias)) # expm1(x) = exp(x) - 1, more accurate for small x
+                self.delta_net.bias.copy_(bias) # this final line is to finally assign the initialized bias
+                                                # to the delta_net network.
         else:
+            # if we opt to not have input-dependent dynamics, we set make the time-step a learnable parameter.
             self.log_step_size_P = nn.Parameter(
                 th.zeros(size=(self.P,)), requires_grad=False
             )
