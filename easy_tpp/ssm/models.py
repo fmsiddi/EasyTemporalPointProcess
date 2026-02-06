@@ -8,7 +8,7 @@ from .initializers import (
     make_DPLR_HiPPO,  # , lecun_normal_ #  init_VinvB, init_log_steps,
 )
 
-MATRIX_SCALING_FACTOR = 1
+MATRIX_SCALING_FACTOR = 1 # not really sure what the use case for this is
 
 
 class LLH(nn.Module):
@@ -141,6 +141,8 @@ class LLH(nn.Module):
         # to a real-valued SSM WHILE ONLY USING HALF THE SPECTRUM
         # if x is real, then x = v + \bar{v} = 2*Re(v) where v is complex
         # this allows us to store only half the eigenvalues/eigenvectors.
+        # see the final paragraph of section 3.3 of Gu's "On the parameterization and intialization
+        # of diagonal state space models" for more details.
 
         # the reason we'd even make this adjustable and not baked into the code is possibly
         # that someone may want to experiment with a fully complex-valued SSM,
@@ -347,6 +349,7 @@ class LLH(nn.Module):
     # accessed syntactically. 
     # this property is established below so we can recover the \Lambda matrix of the model at any point via
     # LLH.Lambda_P
+    # of course, this is made to be a property and not an attribute because we need to perform some computation
     @property
     def Lambda_P(self):
         if self.complex_values:
@@ -358,7 +361,13 @@ class LLH(nn.Module):
             return -self.Lambda_P_log_neg_real.exp()
 
     def _init_B(self):
-        # Initialize the B outside the eigenbasis and then transform.
+        # Initialize the B outside the eigenbasis and then transform by V*.
+        # the key here is that although there is a theoretical HiPPO B, it was found in 
+        # "On the parameterization and initialization of diagonal state space models" (Gu et al., 2022)
+        # at the beginning of page 6 that it was not necessary to initialize B according to the HiPPO, only
+        # A, due to its dominant effect on the dynamics of the SSM. However, allowing B to be learned freely
+        # still allows for some material gain, so they opt to initialize B randomly with Xavier normal 
+        # initialization (while still multiplying it by the eigenvector matrix V).
         B = nn.init.xavier_normal_(th.zeros((self.P, self.H))) * MATRIX_SCALING_FACTOR
         B_tilde_PH = self._Vc_PP @ B.type(th.complex64)
         self.B_tilde_PH = (
@@ -381,9 +390,13 @@ class LLH(nn.Module):
 
     def _init_D(self):
         # Initialize feedthrough (D) matrix. Note the intensity depends on all layers.
+        # xavier normal intitialization is only used on weight matrices (2-dimensional =
+        # mixing of features.) this D here is a vector. as such, regular normal 
+        # initialization will suffice. This follows from section B.1.2 of the S5 paper.
         D_HH = th.zeros(self.H)
         nn.init.normal_(D_HH, std=1.0)
-        self.D_HH = nn.Parameter(D_HH, requires_grad=True)
+        self.D_HH = nn.Parameter(D_HH, requires_grad=True) # the requires_grad=True is redundant here
+                                                           # since nn.Parameter defaults to that.
 
     def _init_E(self):
         E = (
@@ -399,6 +412,7 @@ class LLH(nn.Module):
 
     def compute_impulse(self, right_u_H, mark_embedding_H):
         # Compute impulse to add to left limit of x to make right limit.
+        # this computes E_tilde * a column vector of \alpha
         alpha_P = th.einsum(
             "ph,...h->...p",
             self.E_tilde_PH,
