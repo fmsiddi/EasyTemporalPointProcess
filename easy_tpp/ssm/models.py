@@ -215,8 +215,8 @@ class LLH(nn.Module):
                                  # parallel scan implementation of the SSM state evolution
 
         # implementation toggles for WHERE LayerNorm is applied (it should be one or the other!)
-        self.pre_norm = pre_norm # boolean (default: True) to apply LayerNorm before SSM layer
-        self.post_norm = post_norm # boolean (default: False) to apply LayerNorm after SSM layer
+        self.pre_norm = pre_norm # boolean (default: True) to apply LayerNorm before NEXT SSM layer
+        self.post_norm = post_norm # boolean (default: False) to apply LayerNorm after CURRENT SSM layer
 
         self.is_first_layer = is_first_layer # boolean (default: False) to indicate if this 
                                              # is the first LLH layer
@@ -411,8 +411,21 @@ class LLH(nn.Module):
         )
 
     def compute_impulse(self, right_u_H, mark_embedding_H):
-        # Compute impulse to add to left limit of x to make right limit.
-        # this computes E_tilde * a column vector of \alpha
+        """
+        Compute impulse to add to left limit of x to make right limit.
+        this method is called later on in the forwards() method as:
+        impulse_NP=self.compute_impulse(prime_right_u_NH, mark_embedding_NH)
+        you can see here that the "mark_embedding_H" notation in this method definition
+        is partially misleading, it really only means that the final dimension of "mark_embedding"
+        is H, it is not a Hx1 or 1xH tensor.
+        this is why the einsum notation uses an ellipses (...) before h after the comma. the fact
+        that impulse_NP is NP dimensional basically tells you that it's really N multiplications of E
+        (which is PxH) by a Hx1 tensor \alpha_k (mark_embedding_H)
+        TODO: from what it looks like, they could have just written "ph,nh->np" instead of using ellipses
+              to be more explicit, however we are not taking into account the additional batch dimension,
+              but that doesn't appear to be utlized in this class it seems. monte carlo samples as well.
+              just something to keep in mind. the ellipses buys you that flexibility.
+        """
         alpha_P = th.einsum(
             "ph,...h->...p",
             self.E_tilde_PH,
@@ -422,14 +435,57 @@ class LLH(nn.Module):
         )
         return alpha_P
 
+    """
+    remember the input-dependent scaling formula for \Lambda?
+    \Lambda_i = diag(softplus(W * u_t_i + b)) * \Lambda
+    this is just implementing that. the delta_net is W * u_t_i + b (if relative_time is True),
+    otherwise \Lambda_i = \exp(log(\delta_t))* Lambda.
+    the "diag" part is just handled by the fact that softplus(W * u_t_i + b) is ...xNxP and Lambda_P is P-dimensional vector
+    there is also some logic here if the right limit of the input u is unavailable
+    """
     def get_lambda(self, right_u_NH, shift_u=True):
-        if self.relative_time and (right_u_NH is not None):
+        if self.relative_time and (right_u_NH is not None): # the input may be null for the first layer
+            # shift_u is purely an alignment fix. it makes the u-value used to compute the dynamics for the interval
+            # (t_{i-1},t_i] come from the LEFT ENDPOINT t_{i-1}, not the right endpoint t_i.
+            # it looks like the only time this method is called with shift_U=False is when they say 
+            # "U should already be shifted"
+            # recall that dt_N is stored as [0,t_1-t_0,t_2-t_1,...,t_N-t_{N-1}]
+            # so dt_N[i] corresponds to the interval ENDING at t_i, however we want to use the value at t_i-1
+            # concretely, F.pad(right_u_NH[..., :-1, :], (0, 0, 1, 0)) is doing the following:
+                # right_u_NH[..., :-1, :] drops the last event along the N dimension. N being the number of events
+                # in the sequence. so right_u_NH becomes (...,N-1,H) dimensional with inputs 
+                # [u_0,u_1,...,u_{N-2}]
+                    # remember array[:k] means "return elements up to BUT NOT INCLUDING index k"
+                    # and since python is 0-indexed, you get get k "rows" (or columns if [:,:k])
+                # F.pad(...,(0,0,1,0)) gives a pad "0" on the left and "0" on the right of the last dimension H (the feature dimension),
+                # and pads "1" at the top and a "0" at the bottom of dimension N (the temporal ordering of u)
+                    # F.pad(input,pad) determines how many dimensions you want to pad by how many numbers you enter for 
+                    # arg "pad": something like pad(input, 0,1) means you pad the last dim, whereas pad(input, 0,1,0,0)
+                    # means you are padding the final 2 dims of the tensor.
+            # the theoretical point of this is that the rate over the interval (t_{i-1},t_i] should be determined by the
+            # information at t_{i-1}, meaning that left endpoint should be driving the behavior over the interval, not the
+            # future endpoint t_i.
             if shift_u:  # during "forward" when dts = [0, t1-t0, ..., t_N-t_{N-1}]
-                right_u_NH = F.pad(
+                right_u_NH = F.pad( # F is torch.nn.functional
                     right_u_NH[..., :-1, :], (0, 0, 1, 0)
                 )  # pad default 0 at beginning of second to last dim
             lambda_rescaled_NP = (
-                F.softplus(self.delta_net(right_u_NH)) * self.Lambda_P
+                # recall that delta_net() was initialized as nn.Linear(H,P). this internally creates:
+                # - a weight meatrix W that is PxH
+                # - a bias vector b that is P-dimensional 
+                # - it defines a map f(x) = x * W^T + b
+                # KEY POINT HERE IS IT MULTIPLIES FROM THE RIGHT, NOT THE LEFT
+                # so although you input H first, then P in function call, you actually get a PxH matrix
+                # here we enter right_u_NH which is a (...,N,H) tensor, so which axis W^T applied to?
+                # THE LAST LAYER ONLY. so self.delta_net(right_u_NH) is actually invoking a (1xH)*(HxP) = P multiplication.
+                # so the delta_net is applied to a row of the LAST DIMENSION (H) of right_u_NH at a time.
+                # this is common in pytorch, much of the nn methods involving matrix multiplication with multi-dim
+                # take the last 2 dimensions of the tensor playing the role matrix, and the last dimension of the tensor
+                # playing the role of the vector. this is very common. so although many of these variables only end in
+                # "_H" or "_NH" or "_NP", odds are they are actually (BxH) or (BxNxH) or (BxNxP) respectively, where the
+                # LEADING DIMENSIONS serve as just indices specifying how many times the matrix multiplication needs to
+                # be stored (per batch)
+                F.softplus(self.delta_net(right_u_NH)) * self.Lambda_P 
             )  # predict delta_i from right_u_i
             return {"lambda_rescaled_NP": lambda_rescaled_NP}
         else:
@@ -443,8 +499,8 @@ class LLH(nn.Module):
         self,
         left_u_NH: Optional[th.Tensor],  # Very first layer, should feed in `None`
         right_u_NH: Optional[th.Tensor],  # Very first layer, should feed in `None`
-        mark_embedding_NH: th.Tensor,
-        dt_N: th.Tensor,
+        mark_embedding_NH: th.Tensor, # \alpha, not E or E*\alpha
+        dt_N: th.Tensor, # [0, t1-t0, ..., t_N-t_{N-1}]
         initial_state_P: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor]:
         """
@@ -453,22 +509,61 @@ class LLH(nn.Module):
         In the context of TPPs, this returns the right limit of the "intensity function".
         This intensity will have been passed through a non-linearity, though, and so there is no
         guarantee for it is positive.
+            # what they mean here is that the "intensity" u^(L+1) = LayerNorm(\sigma(y^(L)) + u^(L))
+            # is not guaranteed to be positive UNTIL it is passed thru the scaled softplus:
+            # \lambda_t = ScaledSoftplus(Linear(u_{t-}^(L+1)))
+            
+        _ssm() is the real "LLH recurrence engine" whereas forward() is a WRAPPER that:
+            1) normalizes inputs
+            2) prepares the initial state
+            3) applies the "depth update" u^(l+1) = LayerNorm(\sigma(y^(l)) + u^(l))
+            
+        _ssm() does the state evolution + linear readout part
 
         :param u_NH: [..., seq_len, input_dim]
         :param alpha_NP: [..., seq_len, hidden_dim]
         :param dt_N: [..., seq_len]
         :param initial_state_P: [..., hidden_dim]
-        :return:
+        
+        u^(l+1) = LayerNorm( \sigma(y^(l)) + u^(l) )
+        returns right_x_NP, next_layer_left_u_NH, next_layer_right_u_NH
+        so it returns 
+        1) the right limits of the P states (x) across the N sequence points (per batch)
+        2) the left limits of what will be used as input for the NEXT layer
+        3 the right limits of what will be used as input for the NEXT layer
+        it should be noted here that although we refer to "y" as the output of the LLH layer in the literature,
+        the output of this LLH() code is in fact the transformation of y, that is:
+        u^(l+1) = LayerNorm( \sigma(y^(l)) + u^(l) )
+        however, whether pre_norm or post_norm is toggled affects whether this LayerNorm is applied at the end
+        of the current pass, or the beginning of the next pass.
         """
         # Pull out the dimensions.
-        *leading_dims, _, _ = mark_embedding_NH.shape
+        # the "*" denotes python's extended iterable unpacking (packing operator)
+        # this allows for if mark_embedding has more than 3 axes, that the single "leading_dims"
+        # can store all the preceding dims into one list instead of leading_dims1, leading_dims2, etc.
+        *leading_dims, _, _ = mark_embedding_NH.shape # this will typically just be B
         num_leading_dims = len(leading_dims)
 
+        # the state is P-dimensional, but it needs to be broacast across the B sequences 
+        # basically we just need to reformat initial_state_P as a tensor of [...,P] tensor
+        # (most likely a [B,P] tensor)
         if initial_state_P is None:
             # Pad and expand to match leading dimensions of input
-            initial_state_P = self.initial_state_P.view(
-                *[1 for _ in range(num_leading_dims)], -1
-            ).expand(*leading_dims, -1)
+            initial_state_P = self.initial_state_P.view(# view() returns a new tensor with the same data but of a different
+                                                        # shape, without copying memory
+                *[1 for _ in range(num_leading_dims)] # the * operator is argument unpacking. the view() method takes
+                                                      # arguments one number at a time, not in a list, so since we want to
+                                                      # feed the numbers from the list into view() we unpack it with *
+                                                      # example foo(*[1,2,3]) -> foo(1,2,3)
+                , -1 # this is the last input into the view() method. it basically makes the P dimension the final 
+                     # dimension of this new state tensor we are formatting
+                     # so so far, if we just B as the leading dim, the state tensor's shape is now (1,P)
+                     # if we had, in addition, say G, it would be [1,1,P]
+            ).expand(*leading_dims, -1) # does the final broadcasting without copying data
+                                        # so if the current tensor has shape (1,1,64), if we call .expand(32,100,-1)
+                                        # produces a tensor of size (32,100,64) 
+                                        # the "-1" denoes "keep original size", whereas the "1" dimensions are broadcasted
+                                        # to larger sizes
 
         # Add layer norm
         prime_left_u_NH = left_u_NH
