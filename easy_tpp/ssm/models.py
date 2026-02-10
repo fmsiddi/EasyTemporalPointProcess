@@ -566,6 +566,12 @@ class LLH(nn.Module):
                                         # to larger sizes
 
         # Add layer norm
+        # prime_u is mean to represent the LayerNorm'd u if pre_norm=True
+        # the reason the original u is not overwritten is because it is needed for the residual update when
+        # computing the next layer's input: u^(l+1) = \sigma(y^(l)) + u^(l)
+        # note that the above lacks the LayerNorm wrapper you see in the paper, because the paper presents the
+        # post_norm = True version. for pre_norm=True, the normalized u is absorbed in y^l, and we need the pure
+        # unnormalized u for the residual addition.
         prime_left_u_NH = left_u_NH
         prime_right_u_NH = right_u_NH
         if prime_left_u_NH is not None:  # ONLY for backward variant
