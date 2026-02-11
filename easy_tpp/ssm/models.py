@@ -215,6 +215,8 @@ class LLH(nn.Module):
                                  # parallel scan implementation of the SSM state evolution
 
         # implementation toggles for WHERE LayerNorm is applied (it should be one or the other!)
+        # apparently the reason this optionality is provided is for backpropagation purposes. sometimes the gradient
+        # is more well-behaved when the LayerNorm is applied before the SSM, sometimes after.
         self.pre_norm = pre_norm # boolean (default: True) to apply LayerNorm before NEXT SSM layer
         self.post_norm = post_norm # boolean (default: False) to apply LayerNorm after CURRENT SSM layer
 
@@ -305,6 +307,16 @@ class LLH(nn.Module):
         # We also initialize the step size.
         # relative_time has to do with whether we want to rescale \Lambda at each event time
         # based on the current input u_t_i. this is the "input-dependent dynamics" section of the paper.
+        # see B.3 of S2P2 paper: \delta_i is a time-scaling diagonal matrix that changes the relative timescale
+        # of each channel of the state's influence (a scaling for each p). large values suggest time should pass quickly
+        # for that channel, suggesting faster convergence to steady-state, and smaller values will cause the model to 
+        # retain the influence that prior events have on future ones due to the slower perceived passage of time.
+        # if relative_time = True, we make this a learnable network via diag(softplus(W * u_t_i + b)) and call it "delta_net"
+        # if relative_time = False, then instead of "delta_net", we use "log_step_size_P" and initialize it to 0 and make it unlearnable.
+        # why they make it unlearnable is beyond me, but chatgpt says is that nn.Parameters move to gpu/cuda devices automatically when
+        # calling model.cuda()
+        # it also said they could have used self.register_buffer("log_step_size_P", torch.zeros(self.P)) and gotten the same effect
+        # TODO: maybe reach out to Yuxin and inquire
         # \Lambda_i = diag(softplus(W * u_t_i + b)) * \Lambda
         if self.relative_time:
             self.delta_net = nn.Linear( # delta_net is the W * u_t_i + b part above
@@ -338,7 +350,7 @@ class LLH(nn.Module):
                 self.delta_net.bias.copy_(bias) # this final line is to finally assign the initialized bias
                                                 # to the delta_net network.
         else:
-            # if we opt to not have input-dependent dynamics, we set make the time-step a learnable parameter.
+            # if we opt to not have input-dependent dynamics, we create a constant 
             self.log_step_size_P = nn.Parameter(
                 th.zeros(size=(self.P,)), requires_grad=False
             )
@@ -425,6 +437,8 @@ class LLH(nn.Module):
               to be more explicit, however we are not taking into account the additional batch dimension,
               but that doesn't appear to be utlized in this class it seems. monte carlo samples as well.
               just something to keep in mind. the ellipses buys you that flexibility.
+        TODO: it doesn't appear that right_u_h is needed here since all we're calculating is \tilde{E} * \alpha
+              we can probably remove this as an input.
         """
         alpha_P = th.einsum(
             "ph,...h->...p",
@@ -437,11 +451,18 @@ class LLH(nn.Module):
 
     """
     remember the input-dependent scaling formula for \Lambda?
-    \Lambda_i = diag(softplus(W * u_t_i + b)) * \Lambda
+    \Lambda_i = diag(softplus(W * u_t_i + b)) * \Lambda (Below equation (13) in the paper)
     this is just implementing that. the delta_net is W * u_t_i + b (if relative_time is True),
-    otherwise \Lambda_i = \exp(log(\delta_t))* Lambda.
+    otherwise \Lambda_i = \exp(log(\delta_t))* Lambda = \delta_t * \Lambda
     the "diag" part is just handled by the fact that softplus(W * u_t_i + b) is ...xNxP and Lambda_P is P-dimensional vector
     there is also some logic here if the right limit of the input u is unavailable
+
+    it should also be noted here that the output dimension varies baseed on relative_time flag and whether or not right_u is available.
+    in the case where we are doing input-dependent dynamics with a changing delta_t, then the output tensor will be (...,N,P)
+    whereas if we just doing constant delta_t, then the tensor will be just be (...,P)
+    even if relative_time=Ture, if right_u is not available, then the resulting matrix will also just be (...,P)
+    the names of these keys are relevant in _ssm() because they are used to check whether relative_time = TRUE and if right_u is available
+    simultaneously.
     """
     def get_lambda(self, right_u_NH, shift_u=True):
         if self.relative_time and (right_u_NH is not None): # the input may be null for the first layer
@@ -471,7 +492,7 @@ class LLH(nn.Module):
                 )  # pad default 0 at beginning of second to last dim
             lambda_rescaled_NP = (
                 # recall that delta_net() was initialized as nn.Linear(H,P). this internally creates:
-                # - a weight meatrix W that is PxH
+                # - a weight matrix W that is PxH
                 # - a bias vector b that is P-dimensional 
                 # - it defines a map f(x) = x * W^T + b
                 # KEY POINT HERE IS IT MULTIPLIES FROM THE RIGHT, NOT THE LEFT
@@ -492,8 +513,13 @@ class LLH(nn.Module):
             if self.relative_time:
                 lambda_rescaled_P = F.softplus(self.delta_net.bias) * self.Lambda_P
             else:
-                lambda_rescaled_P = th.exp(self.log_step_size_P) * self.Lambda_P
-            return {"lambda_rescaled_P": lambda_rescaled_P}
+                lambda_rescaled_P = th.exp(self.log_step_size_P) * self.Lambda_P  # remember her that log_step_size_P is just a fixed
+                                                                                  # tensor of 0's. i don't really understand why they
+                                                                                  # do this here and not just set equal to self.Lambda_P
+                                                                                  # TODO: perhaps change this
+            return {"lambda_rescaled_P": lambda_rescaled_P} # note here that the key lambda_rescaled_P differs from lambda_rescaled_NP!
+                                                            # this is the distinguishing factor used in _ssm() to check if 
+                                                            # relative_time=False
 
     def forward(
         self,
@@ -565,20 +591,29 @@ class LLH(nn.Module):
                                         # the "-1" denoes "keep original size", whereas the "1" dimensions are broadcasted
                                         # to larger sizes
 
-        # Add layer norm
+        # Add layer norm if pre_norm = True
         # prime_u is mean to represent the LayerNorm'd u if pre_norm=True
         # the reason the original u is not overwritten is because it is needed for the residual update when
         # computing the next layer's input: u^(l+1) = \sigma(y^(l)) + u^(l)
         # note that the above lacks the LayerNorm wrapper you see in the paper, because the paper presents the
         # post_norm = True version. for pre_norm=True, the normalized u is absorbed in y^l, and we need the pure
         # unnormalized u for the residual addition.
+        # apparently the reason this optionality is provided is for backpropagation purposes. sometimes the gradient
+        # is more well-behaved when the LayerNorm is applied before the SSM, sometimes after.
         prime_left_u_NH = left_u_NH
         prime_right_u_NH = right_u_NH
         if prime_left_u_NH is not None:  # ONLY for backward variant
+            # the below assert block found in each if clause is just a shape check.
+            # the zip() method pairs elements of one list with the elements of the other list in order.
+            # so if x.shape = y.shape = (B,N,H), then zip(x.shape,y.shape) will produce pairs (B,B) (N,N) and (H,H)
+            # the for loop checks to see that each of these dimensions do match, and the assert all() checks that every
+            # output of the for loop is True. (all() returns True if every element is True, False otherwise)
+            # assert will throw an error if it returns false.
             assert all(
                 u_d == a_d
                 for u_d, a_d in zip(prime_left_u_NH.shape, mark_embedding_NH.shape)
             )  # All but last dimensions should match
+               # this comment above is misleading, because it's checking that ALL dimensions match, including the last one...
             if self.pre_norm:
                 prime_left_u_NH = self.norm(prime_left_u_NH)
         if prime_right_u_NH is not None:
@@ -586,13 +621,15 @@ class LLH(nn.Module):
                 u_d == a_d
                 for u_d, a_d in zip(prime_right_u_NH.shape, mark_embedding_NH.shape)
             )  # All but last dimensions should match
+               # this comment above is misleading, because it's checking that ALL dimensions match, including the last one...
             if self.pre_norm:
                 prime_right_u_NH = self.norm(prime_right_u_NH)
 
+        # this _ssm() call is what actually carries out the bulk of of Algorithm 1
         right_x_NP, left_y_NH, right_y_NH = self._ssm(
             left_u_NH=prime_left_u_NH,
             right_u_NH=prime_right_u_NH,
-            impulse_NP=self.compute_impulse(prime_right_u_NH, mark_embedding_NH),
+            impulse_NP=self.compute_impulse(prime_right_u_NH, mark_embedding_NH), # \tilde{E} * \alpha
             dt_N=dt_N,
             initial_state_P=initial_state_P,
         )
@@ -634,28 +671,32 @@ class LLH(nn.Module):
     ):
         *leading_dims, N, P = impulse_NP.shape
         u_NH = right_u_NH  # This implementation does not use left_u, nor does it compute left_y
-        if u_NH is not None:
-            impulse_NP = impulse_NP + th.einsum(
+        if u_NH is not None: # meaning: if we are not in the first layer
+            impulse_NP = impulse_NP + th.einsum( # \tilde{E}*\alpha + \tilde{B}*u
                 "ph,...nh->...np",
                 self.B_tilde_PH,
                 u_NH.type(th.complex64) if self.complex_values else u_NH,
             )
-            y_u_res_NH = th.einsum(
+            y_u_res_NH = th.einsum( # D * u
                 "...nh,h->...nh", u_NH, self.D_HH
             )  # D_HH should really be D_H
         else:
             assert self.is_first_layer
             y_u_res_NH = 0.0
 
-        lambda_res = self.get_lambda(right_u_NH=right_u_NH, shift_u=True)
+        lambda_res = self.get_lambda(right_u_NH=right_u_NH, shift_u=True) # retrieve Lambda_i
         if "lambda_rescaled_P" in lambda_res:  # original formulation
-            lambda_dt_NP = th.einsum(
+                                               # Lambda_i will only be P-dimensional if right_u is unavailable or relative_time=False
+            lambda_dt_NP = th.einsum( # this gives us \Lambda_i * delta_t. we will need to exponentiate this to get the discretized
+                                      # version \bar{Lambda}_i
                 "...n,p->...np", dt_N, lambda_res["lambda_rescaled_P"]
             )
-        else:  # relative time
+        else:  # relative_time = True and right_u is available
             lambda_dt_NP = th.einsum(
                 "...n,...np->...np", dt_N, lambda_res["lambda_rescaled_NP"]
             )
+
+        # so far we have not touched anything that has to do with the state x yet.
 
         if self.for_loop:
             right_x_P = initial_state_P
