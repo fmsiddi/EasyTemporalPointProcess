@@ -672,6 +672,11 @@ class LLH(nn.Module):
         *leading_dims, N, P = impulse_NP.shape
         u_NH = right_u_NH  # This implementation does not use left_u, nor does it compute left_y
         if u_NH is not None: # meaning: if we are not in the first layer
+            # here is an important distinction between how the "vanilla" LLH class behaves vs. its more true-to-form ZOH variants below.
+            # \tilde{B}*u is treated like an event-syncronous jump-like additive term, getting wrapped up with \tidle{E}*\alpha instead
+            # of being discretized as shown in the paper. that is to say, this base LLH class REINTERPRETS u as an event-tied input 
+            # (a learned impulse) rather thatn a continuous-time control held between events. it is NOT the ZOH discretization we
+            # see in the paper.
             impulse_NP = impulse_NP + th.einsum( # \tilde{E}*\alpha + \tilde{B}*u
                 "ph,...nh->...np",
                 self.B_tilde_PH,
@@ -684,24 +689,27 @@ class LLH(nn.Module):
             assert self.is_first_layer
             y_u_res_NH = 0.0
 
+        # this gives us \Lambda_i * delta_t. we will need to exponentiate this to get the discretized
+        # version \bar{Lambda}_i
         lambda_res = self.get_lambda(right_u_NH=right_u_NH, shift_u=True) # retrieve Lambda_i
         if "lambda_rescaled_P" in lambda_res:  # original formulation
-                                               # Lambda_i will only be P-dimensional if right_u is unavailable or relative_time=False
-            lambda_dt_NP = th.einsum( # this gives us \Lambda_i * delta_t. we will need to exponentiate this to get the discretized
-                                      # version \bar{Lambda}_i
+                                               # Lambda_i=\Lambda (no rescaling) will only be P-dimensional if right_u is unavailable 
+                                               # or relative_time=False
+            lambda_dt_NP = th.einsum( # \Lambda_P * delta_t
                 "...n,p->...np", dt_N, lambda_res["lambda_rescaled_P"]
             )
         else:  # relative_time = True and right_u is available
-            lambda_dt_NP = th.einsum(
+            lambda_dt_NP = th.einsum( # \delta_i * \Lambda * delta_t (\delta_i in the input-dependent rescaler for each channel of x)
                 "...n,...np->...np", dt_N, lambda_res["lambda_rescaled_NP"]
             )
 
         # so far we have not touched anything that has to do with the state x yet.
 
-        if self.for_loop:
+        if self.for_loop: # this is the slow, recursive version. probably used for debugging/reference
             right_x_P = initial_state_P
             right_x_NP = []
-            for i in range(N):
+            for i in range(N): # again, only A is discretized in this base LLH implementation. we compute x via
+                               # x = exp(\Lambda_i * dt) * right_x + \tilde{B}*u + \tilde{E}*\alpha
                 right_x_P = (
                     lambda_dt_NP[..., i, :].exp() * right_x_P + impulse_NP[..., i, :]
                 )
@@ -710,24 +718,107 @@ class LLH(nn.Module):
         else:
             # Trick inspired by: https://github.com/PeaBrane/mamba-tiny/blob/master/scans.py
             # .unsqueeze(-2) to add sequence dimension to initial state
+            # this is not the classic Blelloch affine-pair scan, but an algebraic transformation that
+            # reduces the recurrence to a stabilized prefix-sum in log space.
+            
+            # as a quick review, we can perform parallel scans (running sums) when we have an associative operator \circdot
+            # if we have x_i = r_i * x_{i-1} + b_i
+            #            r_i = exp(\lambda_i * \delta_{t_i})
+            # then we can perform a scan over an assoicative operator on affine transforms
+            # we can let T_i() represent the affine map at step i: T_i(x) := r_i * x + b_i
+            # recursively: T_2(T_1(x)) = r_2 * (r_1 * x + b_1) + b_2 = (r_2 * r_1) * x + (r_2 * b_1 + b_2)
+            # we can define this recursion using the associative operator \circdot: 
+            # (r_2, b_2) \circdot (r_1, b_1) = (r_2 * r_1, r_2 * b_1 + b_2)
+            # so the "true" parallel-scan view is: (r_{0:i}, b_{0:i}) = (r_i, b_i) \circdot ... \circdot (r_0, b_0)
+            
+            # this code is NOT doing that as it is presented in the S2P2 paper, instead, it is drawing from the paper
+            # "Efficient Parallelization of a Ubiquitous Sequential Computation" (Heinsen 2023) that uses a cumulative sum
+            # and logcumsumexp (LCSE) trick. it works as follows:
+            
+            # assume x_t = a_t * x_{t-1} + b_t
+            # the vector log x_t is computable as a composition of two cumulative (aka prefix) sums, each of which is parallelizable:
+            # log x_t = a_t^* + log(x_0 + b_t^*), with the following prefix sums:
+            # a_t^* = \sum_t^cum log a_t
+            # b_t^* = \sum_t^cum exp(log(b_t) - a_t^*)
+            # x can then be computed via element-wise exponentiation
+            # x_t = exp(a_t^* + log(x_0 + b_t^*))
+            # if you read the paper they eventually show that:
+            # x_t = (\prod_t^{cum} a_t) \circdot (x_0 + \sum_t^cum exp(log(b_t) - \sum_t^cum log(a_t)))
+            # taking the logarithm of both sides yields
+            # log x_t = \sum_t^cum log a_t + log(x_0 + \sum_t^cum exp(log(b_t) - \sum_t^cum log(a_t))) 
+            # this is carried out numerically via the nested function call:
+            
+            # log x_t = log(a_t^*) + log(tail(LCSE(cat(log x_0, log (b_t) - a_t^*))))
+            
+            # cat() denotes concatenation
+            # tail() removes its argument's first element
+            # LCSE() is the logcumsumexp function, which computes log(\sum_t^cum exp()) in a numerically stable way.
+            # that is what righ_x_log_NP is below, just in the case of tensors instead of vectors.
             log_impulse_Np1_P = th.concat(
-                (initial_state_P.unsqueeze(-2), impulse_NP), dim=-2
-            ).log()
-            lamdba_dt_star = F.pad(lambda_dt_NP.cumsum(-2), (0, 0, 1, 0))
+                (initial_state_P.unsqueeze(-2), impulse_NP), dim=-2 # recall initial_state_P is (B,P) and impulse_NP is (B,N,P), 
+                                                                    # so we need to unsqueeze initial_state_P to make it (B,1,P) 
+                                                                    # before concatenating along the sequence dimension N (-2)
+            # here's an example of what this may look like: let B=2, N=3, P=2
+            # let intial_state_P = [[1,2],
+            #                       [3,4]] (shape (2,2))
+            # then initial_state_P.unsqueeze(-2) = [[[1,2]],
+            #                                       [[3,4]]] (shape (2,1,2) (note the double bracket before the comma))
+            # let impulse_NP = [[[10,11],[12,13],[14,15]],
+            #                   [[16,17],[18,19],[20,21]]] (shape (2,3,2))
+            # you can see each state is a 2-element array, and there are 3 states per sequence, and we have 2 of these sequences in the batch
+            # if you want to visually identify the axes, the P axis exists within the inner-most brackets
+            # the N (sequence) dimension can be read horizontally across rows, with each element being a 2-dimensional state
+            # the B (batch) dimension can be read vertically as the columns of these rows, so each new row represents another batch
+            # that is, each row represents a separate sequence
+            # so, when we concatenate initial_state_P.unsqueeze(-2) along dim=-2 (the sequence dimension N), we get:
+            # log_impulse_Np1_PP = [[[1,2],[10,11],[12,13],[14,15]],
+            #                       [[3,4],[16,17],[18,19],[20,21]]] (shape (2,4,2))
+            # so we have appended the initial state to the beginning of each sequence in the batch. represented symbollically:
+            # log_impulse_Np1_P = [V^{-1}*x_0, 
+            #                      \tilde{B}*u_0 + \tilde{E}*\alpha_0, 
+            #                      \tilde{B}*u_1 + \tilde{E}*\alpha_1, 
+            #                      \tilde{B}*u_2 + \tilde{E}*\alpha_2] for each sequence in the batch
+            
+            # NOTE: we have one additional element in the sequence dimension now (N+1 instead of N), so we will need some padding below:
+            ).log() # we take the log of this concatenated tensor to prepare for the LCSE step. this is the log(b_t) term in the LCSE formula
+            lamdba_dt_star = F.pad(lambda_dt_NP.cumsum(-2), (0, 0, 1, 0)) # lambda_dt_NP is just \Lambda_i * delta_t which is (BNP)-dimensional
+                                                                          # we need to compute the cumulative sum of this along the sequence 
+                                                                          # dimension N (-2) while adding a pad entry of 1 at the beginning of the 
+                                                                          # sequence dimension.
+                                                                          # this is essentially a_t^* in the extended annotation above.
             right_x_log_NP = (
-                th.logcumsumexp(log_impulse_Np1_P - lamdba_dt_star, -2) + lamdba_dt_star
+                th.logcumsumexp(log_impulse_Np1_P - lamdba_dt_star, -2) + lamdba_dt_star # the -2 denotes that the logcumsumexp is being 
+                                                                                         # taken along the sequence dimension N, and the 
+                                                                                         # addition of lamdba_dt_star is the final step in 
+                                                                                         # the LCSE formula to recover log x_t from the 
+                                                                                         # intermediate variable. see the extended annotation 
+                                                                                         # above for more details.
             )
-            right_x_NP = right_x_log_NP.exp()[..., 1:, :]
+            right_x_NP = right_x_log_NP.exp()[..., 1:, :] # finally we exponentiate, ignoring the first dimension we padded earlier
 
         conj_sym_mult = 2 if self.conj_sym else 1
-        y_NH = (
+        y_NH = ( # remember we are taking the complex \tilde{x} and coverting back to real x. 
+                 # if y = \tilde{C} * \tilde{x} + D * u, we use the fact that \tilde{x} = V * x, and V yields from the diagonalization of A,
+                 # which we assume has conjugate symmetery if conj_sym=True, so ignoring the D*u for a bit, if we write the matrix 
+                 # multiplication in summation form, we have S = \sum_1^P \tilde{C}_{hp} * \tilde{x}_p
+                 # and since x MUST be real, and D*u is real, we know that the \sum_1^P \tilde{C}_{hp} * \tilde{x}_p must have cancellation
+                 # of its imaginary parts. and since we know there is conjugate symmetry, then if z = \tilde{C}_{hp} * \tilde{x}_p
+                 # then we have S = z + \bar{z} = 2*Re(z) = 2*Re(\tilde{C}_{hp} * \tilde{x}_p). 
             conj_sym_mult
             * th.einsum("...np,hp->...nh", right_x_NP, self.C_tilde_HP).real
-            + y_u_res_NH
+            + y_u_res_NH # + D*u
         )
+        # TODO: to be honest, this final line seems suspect. if conj_sym=False, why are we only keeping the real part?
+        #       it also looks like we never take advantage of the fact that conj_sym=True would allows us to use half the memory,
+        #       because we are still storing the full complex \tilde{C} and \tilde{x} instead of just the half that is needed?
 
         return right_x_NP, None, y_NH
 
+    # the final two methods are used for approximating the integral \int_0^T \lambda_t dt in the log likelihood used in training.
+    # obviously we don't have the entire continuous trajactory of \lambda_t, so we must sample G (s_{k,g}) points along the trajectory between
+    # the events, evolve the state to these points, and evaluate the intensity at these points.
+    # this first method evolves x to these points and returns their left limits.
+    # the fact that we are doing this between event times means we have no additive event impuls \tilde{E}*\alpha or input impulse \tilde{B}*u
     def get_left_limit(
         self,
         right_limit_P: th.Tensor,  # Along with dt, can have any number of leading dimensions, produces a tensor of dim ...MP
@@ -750,6 +841,9 @@ class LLH(nn.Module):
         if current_right_u_H is not None and self.pre_norm:
             current_right_u_H = self.norm(current_right_u_H)
 
+        # in _ssm(), we were finding exp(\Lambda_i * delta_t) where delta_t was the time between events.
+        # here we are finding exp(\Lambda_i * delta_s) where delta_s is the time between the event and the sampled point 
+        # along the trajectory, so we can evolve the state to that point.
         lambda_res = self.get_lambda(
             current_right_u_H, shift_u=False
         )  # U should already be shifted
@@ -762,6 +856,7 @@ class LLH(nn.Module):
                 th.einsum("...g,...p->...gp", dt_G, lambda_res["lambda_rescaled_NP"])
             )
 
+        # literally all it takes to get the left limit is to compute exp(\Lambda_i * delta_s) * x_{t_i} and that's it.
         return th.einsum("...p,...gp->...gp", right_limit_P, lambda_bar_GP)
 
     def depth_pass(
