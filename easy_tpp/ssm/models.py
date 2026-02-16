@@ -664,6 +664,7 @@ class LLH(nn.Module):
     def _ssm(
         self,
         left_u_NH: Optional[th.Tensor],  # Very first layer, should feed in `None`
+                                         # left_u is used in forward variant, not here.
         right_u_NH: Optional[th.Tensor],  # Very first layer, should feed in `None`
         impulse_NP: th.Tensor,
         dt_N: th.Tensor,  # [0, t_1 - t_0, ..., t_N - t_{N-1}]
@@ -818,7 +819,7 @@ class LLH(nn.Module):
     # obviously we don't have the entire continuous trajactory of \lambda_t, so we must sample G (s_{k,g}) points along the trajectory between
     # the events, evolve the state to these points, and evaluate the intensity at these points.
     # this first method evolves x to these points and returns their left limits.
-    # the fact that we are doing this between event times means we have no additive event impuls \tilde{E}*\alpha or input impulse \tilde{B}*u
+    # the fact that we are doing this between event times means we have no additive event impulse \tilde{E}*\alpha or input impulse \tilde{B}*u
     def get_left_limit(
         self,
         right_limit_P: th.Tensor,  # Along with dt, can have any number of leading dimensions, produces a tensor of dim ...MP
@@ -859,7 +860,9 @@ class LLH(nn.Module):
         # literally all it takes to get the left limit is to compute exp(\Lambda_i * delta_s) * x_{t_i} and that's it.
         return th.einsum("...p,...gp->...gp", right_limit_P, lambda_bar_GP)
 
-    def depth_pass(
+    def depth_pass( # this method is for producing the final input u^(L+1) for the interarrival points dt_G so the intensity
+                    # can be computed at those points. this differs from forward() since forward is for event times, which 
+                    # requires event impulse terms.
         self,
         current_left_x_P: th.Tensor,  # No leading dimensions (seq, batch, etc.) here because we accommodate any of them
         current_left_u_H: Optional[
@@ -921,6 +924,13 @@ class Int_Forward_LLH(LLH):
         In the context of TPPs, this returns the right limit of the "intensity function".
         This intensity will have been passed through a non-linearity, though, and so there is no
         guarantee for it is positive.
+            # what they mean here is that the "intensity" u^(L+1) = LayerNorm(\sigma(y^(L)) + u^(L))
+            # is not guaranteed to be positive UNTIL it is passed thru the scaled softplus:
+            # \lambda_t = ScaledSoftplus(Linear(u_{t-}^(L+1)))
+            
+        Another conceptual difference here is that whereas in LLH we combine Bu and E\alpha into a single
+        event impulse to get the RIGHT limit of x, here we separate them, since Bu gets us the left limit of x,
+        and then adding E\alpha get us the right limit.
 
         :param u_NH: [..., seq_len, input_dim]
         :param alpha_NP: [..., seq_len, hidden_dim]
@@ -932,6 +942,9 @@ class Int_Forward_LLH(LLH):
         # Pull out the dimensions.
         *leading_dims, N, P = impulse_NP.shape
 
+        # although the base LLH class computes \tilde{B}*u first since it adds it as an event impulse,
+        # here the \Lambda_i*dt is computed first since it is needed to compute the discretized version
+        # of AB: \bar{AB} = (\exp(\Lambda_i * dt) - I) * \tilde{B}
         lambda_res = self.get_lambda(right_u_NH=right_u_NH, shift_u=True)
         if "lambda_rescaled_P" in lambda_res:
             lambda_rescaled = lambda_res["lambda_rescaled_P"]
@@ -954,6 +967,7 @@ class Int_Forward_LLH(LLH):
             assert self.is_first_layer
             left_Du_NH = 0.0
 
+        # calculating Bu and Du
         if right_u_NH is not None:
             right_u_NH = F.pad(right_u_NH[..., :-1, :], (0, 0, 1, 0))
             right_Bu_NP = th.einsum(
@@ -971,7 +985,7 @@ class Int_Forward_LLH(LLH):
             assert self.is_first_layer
             right_Bu_NP = right_Du_NH = 0.0
 
-        if self.for_loop:
+        if self.for_loop: # slow recursive version, probably used for debugging/reference
             right_x_P = initial_state_P
             left_x_NP, right_x_NP = [], []
             for i in range(N):
@@ -988,6 +1002,7 @@ class Int_Forward_LLH(LLH):
                 left_x_NP, dim=-2
             )  # discard initial_hidden_states, left_limit of xs for [t0, t1, ...]
         else:
+            # parallel scan version to get right limit of x
             # Trick inspired by: https://github.com/PeaBrane/mamba-tiny/blob/master/scans.py
             # .unsqueeze(-2) to add sequence dimension to initial state
             log_impulse_Np1_P = th.concat(
@@ -997,9 +1012,21 @@ class Int_Forward_LLH(LLH):
             right_x_log_NP = (
                 th.logcumsumexp(log_impulse_Np1_P - lamdba_dt_star, -2) + lamdba_dt_star
             )
+            # note that in Algorithm 1, first the right limit is computed, then the left limit is computed
+            # by subtracting the event impulse from the right limit:
+            # x_i- = x_i+ -\tilde{E}*\alpha_i
+            # here, we do not subtract the event impulse from the right limit. instead, we invoke
+            # equation (15):
+            # x_i- = \bar{A}*x_{i-1+} + \bar{AB}*u_{i-1+}
+            # which excludes the event impulse. notice the change in subscript.
+            # this explains the comment "Evolves previous..." below.
+            # I believe the main reason they do this is to avoid catastrophic cancellation in the case of 
+            # large event impulses, which would cause the right limit and left limit to be very close in value, 
+            # and thus lead to numerical instability when computing the left limit as the difference of the right 
+            # limit and the event impulse.
             right_x_NP = right_x_log_NP.exp()  # Contains initial_state_P in index 0
-            left_x_NP = (
-                lambda_dt_NP.exp() * right_x_NP[..., :-1, :] + right_Bu_NP
+            left_x_NP = ( # note here that we actually compute the left-limit here unlike the LLH class
+                lambda_dt_NP.exp() * right_x_NP[..., :-1, :] + right_Bu_NP # this is equation (15)
             )  # Evolves previous hidden state forward to compute left limit
             right_x_NP = right_x_NP[..., 1:, :]
 
@@ -1017,6 +1044,11 @@ class Int_Forward_LLH(LLH):
 
         return right_x_NP, left_y_NH, right_y_NH
 
+    # used for approximating the integral \int_0^T \lambda_t dt in the log likelihood used in training.
+    # obviously we don't have the entire continuous trajactory of \lambda_t, so we must sample G (s_{k,g}) points along the trajectory 
+    # between the events, evolve the state to these points, and evaluate the intensity at these points.
+    # this method evolves x to these points and returns their left limits.
+    # the fact that we are doing this between event times means we have no additive event impulse \tilde{E}*\alpha
     def get_left_limit(
         self,
         right_limit_P: th.Tensor,  # Along with dt, can have any number of leading dimensions, produces a tensor of dim ...MP
@@ -1034,7 +1066,11 @@ class Int_Forward_LLH(LLH):
         """
         if current_right_u_H is not None and self.pre_norm:
             current_right_u_H = self.norm(current_right_u_H)
-
+        
+        # this is unchanged from LLH
+        # in _ssm(), we were finding exp(\Lambda_i * delta_t) where delta_t was the time between events.
+        # here we are finding exp(\Lambda_i * delta_s) where delta_s is the time between the event and the sampled point 
+        # along the trajectory, so we can evolve the state to that point.
         lambda_res = self.get_lambda(
             current_right_u_H, shift_u=False
         )  # U should already be shifted
@@ -1049,7 +1085,7 @@ class Int_Forward_LLH(LLH):
 
         # lambda_rescaled_P = th.exp(self.log_step_size_P) * self.Lambda_P
         # lambda_bar_GP = th.exp(th.einsum('...g,p->...gp', dt_G, lambda_rescaled_P))
-        int_hidden_GP = th.einsum("...p,...gp->...gp", right_limit_P, lambda_bar_GP)
+        int_hidden_GP = th.einsum("...p,...gp->...gp", right_limit_P, lambda_bar_GP) # this is what LLH returns
 
         if current_right_u_H is None:  # no Bu term
             assert self.is_first_layer
