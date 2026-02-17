@@ -510,7 +510,7 @@ class LLH(nn.Module):
             )  # predict delta_i from right_u_i
             return {"lambda_rescaled_NP": lambda_rescaled_NP}
         else:
-            if self.relative_time:
+            if self.relative_time: # relative_time is true but it's the first layer
                 lambda_rescaled_P = F.softplus(self.delta_net.bias) * self.Lambda_P
             else:
                 lambda_rescaled_P = th.exp(self.log_step_size_P) * self.Lambda_P  # remember her that log_step_size_P is just a fixed
